@@ -5,9 +5,10 @@ from tkinter import simpledialog, messagebox
 
 from PIL import ImageTk
 
-from capture import CaptureWorker
+import wincap
+from capture import make_worker, WindowCaptureWorker
 from regions import Region, RegionManager, FPS_CHOICES
-from selector import RegionSelector
+from selector import RegionSelector, WindowPicker, CropSelector
 
 BG = "#1e1e1e"
 CARD_BG = "#2a2a2a"
@@ -25,7 +26,7 @@ class RegionCard(tk.Frame):
         super().__init__(master, bg=CARD_BG, padx=10, pady=10)
         self.app = app
         self.region = region
-        self.worker = CaptureWorker(region)
+        self.worker = make_worker(region)
         self.worker.start()
         self._photo = None
         self._after_id = None
@@ -79,20 +80,27 @@ class RegionCard(tk.Frame):
 
     def _tick(self):
         r = self.region
+        frame = self.worker.latest_frame()
+        if not r.paused and frame is not None:
+            thumb = frame.copy()
+            thumb.thumbnail(PREVIEW_MAX)
+            self._photo = ImageTk.PhotoImage(thumb)
+            self.preview.configure(image=self._photo, width=thumb.width,
+                                   height=thumb.height)
         if r.paused:
             self.status_lbl.configure(text="Paused", fg="#e0a030")
+        elif self.worker.note:
+            self.status_lbl.configure(text=self.worker.note, fg="#e0a030")
         else:
-            frame = self.worker.latest_frame()
-            if frame is not None:
-                thumb = frame.copy()
-                thumb.thumbnail(PREVIEW_MAX)
-                self._photo = ImageTk.PhotoImage(thumb)
-                self.preview.configure(image=self._photo, width=thumb.width,
-                                       height=thumb.height)
             self.status_lbl.configure(
                 text=f"Monitoring · {min(self.worker.measured_fps, r.fps):.0f} fps",
                 fg="#5dbb63")
-        self.geo_lbl.configure(text=f"({r.x}, {r.y})  {r.w}x{r.h}")
+        if r.mode == "window":
+            size = f"{frame.width}x{frame.height}" if frame else "—"
+            crop = "  (cropped)" if r.crop else ""
+            self.geo_lbl.configure(text=f"⊞ {r.window_title[:24]}  {size}{crop}")
+        else:
+            self.geo_lbl.configure(text=f"({r.x}, {r.y})  {r.w}x{r.h}")
         interval = 500 if r.paused else max(int(1000 / r.fps), 16)
         self._after_id = self.after(interval, self._tick)
 
@@ -116,11 +124,20 @@ class RegionCard(tk.Frame):
             self.app.manager.save()
 
     def reselect(self):
-        def apply(x, y, w, h):
-            self.region.x, self.region.y = x, y
-            self.region.w, self.region.h = w, h
-            self.app.manager.save()
-        self.app.open_selector(apply)
+        if self.region.mode == "window":
+            def apply_window(title, crop):
+                self.region.window_title = title
+                self.region.crop = crop
+                if isinstance(self.worker, WindowCaptureWorker):
+                    self.worker.invalidate()
+                self.app.manager.save()
+            self.app.pick_window(apply_window)
+        else:
+            def apply_screen(x, y, w, h):
+                self.region.x, self.region.y = x, y
+                self.region.w, self.region.h = w, h
+                self.app.manager.save()
+            self.app.open_selector(apply_screen)
 
     def delete(self):
         if not messagebox.askyesno("Delete region",
@@ -153,10 +170,12 @@ class Dashboard:
         header.pack(fill="x")
         tk.Label(header, text="RegionOS", bg=BG, fg=FG,
                  font=("Segoe UI", 16, "bold")).pack(side="left")
-        tk.Button(header, text="+ New Region", command=self.new_region,
-                  bg=ACCENT, fg="white", relief="flat", font=("Segoe UI", 10, "bold"),
-                  padx=12, pady=4, cursor="hand2",
-                  activebackground="#3a8eef", activeforeground="white").pack(side="right")
+        new_btn = tk.Button(header, text="+ New Region", bg=ACCENT, fg="white",
+                            relief="flat", font=("Segoe UI", 10, "bold"),
+                            padx=12, pady=4, cursor="hand2",
+                            activebackground="#3a8eef", activeforeground="white")
+        new_btn.configure(command=lambda: self._new_region_menu(new_btn))
+        new_btn.pack(side="right")
 
         # Scrollable card list
         wrapper = tk.Frame(root, bg=BG)
@@ -202,6 +221,44 @@ class Dashboard:
         self.cards.append(card)
 
     # --- region creation -----------------------------------------------------
+
+    def _new_region_menu(self, button):
+        menu = tk.Menu(self.root, tearoff=0, bg=CARD_BG, fg=FG,
+                       activebackground=ACCENT, activeforeground="white",
+                       font=("Segoe UI", 10))
+        menu.add_command(label="  Screen area — fixed rectangle on screen",
+                         command=self.new_region)
+        menu.add_command(label="  Application window — tracks the app even when covered",
+                         command=self.new_window_region)
+        menu.post(button.winfo_rootx(),
+                  button.winfo_rooty() + button.winfo_height() + 4)
+
+    def pick_window(self, on_done):
+        """WindowPicker → snapshot → CropSelector → on_done(title, crop)."""
+        def picked(hwnd, title):
+            snapshot = wincap.grab_window(hwnd)
+            if snapshot is None:
+                messagebox.showerror(
+                    "RegionOS", f'Could not capture "{title}".\n'
+                    "The window may be minimized — restore it and try again.",
+                    parent=self.root)
+                return
+            CropSelector(self.root, snapshot, lambda crop: on_done(title, crop))
+        WindowPicker(self.root, picked)
+
+    def new_window_region(self):
+        def done(title, crop):
+            name = simpledialog.askstring(
+                "New region", "Region name:", initialvalue=title[:40],
+                parent=self.root)
+            if name is None:
+                return
+            region = Region(name=name.strip() or title[:40], x=0, y=0, w=0, h=0,
+                            mode="window", window_title=title, crop=crop)
+            self.manager.add(region)
+            self.add_card(region)
+            self.refresh_empty_state()
+        self.pick_window(done)
 
     def open_selector(self, on_select):
         """Hide the dashboard, run the drag overlay, then restore."""

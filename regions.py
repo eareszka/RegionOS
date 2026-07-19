@@ -19,6 +19,13 @@ class Region:
     h: int
     fps: int = 10
     paused: bool = False
+    # mode "screen": capture the fixed screen rectangle (x, y, w, h).
+    # mode "window": capture an application window (found by window_title),
+    #   even when it is covered by other windows; x/y/w/h are unused.
+    mode: str = "screen"
+    window_title: str = ""
+    # Optional [x, y, w, h] crop inside the window's client area
+    crop: list | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
