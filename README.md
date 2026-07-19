@@ -25,6 +25,19 @@ Each region card shows a **live preview**, geometry, and status; per-region **FP
 - *Minimized* windows aren't rendered by Windows — the region freezes on the last frame and shows "Minimized". Keep the window open-but-covered instead.
 - *Background browser tabs* aren't rendered by the browser. Pop the tab out into its own window and track that.
 
+**Browsers pause when fully covered.** Chrome/Edge stop painting a window that
+is completely hidden behind opaque windows, so a tracked page can appear frozen.
+RegionOS's own window is exempt (it renders at 99% opacity, which Chromium
+doesn't count as occluding). For *other* windows covering the browser, either
+leave a sliver of the browser visible, or launch it with throttling disabled:
+
+```
+chrome.exe --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling
+msedge.exe  (same flags)
+```
+
+Firefox: set `widget.windows.window_occlusion_tracking.enabled` to false in `about:config`.
+
 ## Files
 
 | File | Role |

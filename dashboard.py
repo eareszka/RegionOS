@@ -165,6 +165,10 @@ class Dashboard:
         root.configure(bg=BG)
         root.geometry("460x640")
         root.minsize(420, 300)
+        # 99% opacity makes this a layered window. Chromium browsers pause
+        # rendering when fully covered by an opaque window; layered windows
+        # don't count as occluding, so pages keep animating under RegionOS.
+        root.attributes("-alpha", 0.99)
 
         header = tk.Frame(root, bg=BG, padx=14, pady=12)
         header.pack(fill="x")
