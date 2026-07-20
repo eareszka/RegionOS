@@ -9,13 +9,26 @@ import wincap
 from wincap import virtual_screen_bounds
 
 
+def _locked_endpoint(x0, y0, x1, y1, aspect):
+    """Adjust (x1, y1) so the box anchored at (x0, y0) has the given w/h
+    aspect ratio, preserving drag direction and growing from whichever
+    axis the user has dragged further (scaled by the ratio)."""
+    dx, dy = x1 - x0, y1 - y0
+    sx, sy = (1 if dx >= 0 else -1), (1 if dy >= 0 else -1)
+    w = max(abs(dx), abs(dy) * aspect)
+    h = w / aspect
+    return x0 + sx * w, y0 + sy * h
+
+
 class RegionSelector(tk.Toplevel):
     """Dimmed overlay covering every monitor. Drag a rectangle; on release,
-    calls on_select(x, y, w, h) in absolute screen coordinates. Esc cancels."""
+    calls on_select(x, y, w, h) in absolute screen coordinates. Esc cancels.
+    If aspect (w/h) is given, the drag is locked to that ratio."""
 
-    def __init__(self, master, on_select):
+    def __init__(self, master, on_select, aspect: float | None = None):
         super().__init__(master)
         self.on_select = on_select
+        self.aspect = aspect
         self.vx, self.vy, vw, vh = virtual_screen_bounds()
 
         self.overrideredirect(True)
@@ -26,13 +39,14 @@ class RegionSelector(tk.Toplevel):
 
         self.canvas = tk.Canvas(self, bg="black", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.create_text(
-            vw // 2, 60, text="Drag a box over the area to capture  —  Esc to cancel",
-            fill="#cccccc", font=("Segoe UI", 16),
-        )
+        hint = "Drag a box over the area to capture  —  Esc to cancel"
+        if aspect:
+            hint += "  (locked to box shape)"
+        self.canvas.create_text(vw // 2, 60, text=hint, fill="#cccccc", font=("Segoe UI", 16))
 
         self._start = None
         self._rect = None
+        self._end = None
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
@@ -41,19 +55,24 @@ class RegionSelector(tk.Toplevel):
 
     def _press(self, e):
         self._start = (e.x, e.y)
+        self._end = (e.x, e.y)
         self._rect = self.canvas.create_rectangle(
             e.x, e.y, e.x, e.y, outline="#ff4444", width=2
         )
 
     def _drag(self, e):
-        if self._rect and self._start:
-            self.canvas.coords(self._rect, *self._start, e.x, e.y)
+        if not (self._rect and self._start):
+            return
+        x1, y1 = (_locked_endpoint(*self._start, e.x, e.y, self.aspect)
+                  if self.aspect else (e.x, e.y))
+        self._end = (x1, y1)
+        self.canvas.coords(self._rect, *self._start, x1, y1)
 
     def _release(self, e):
         if not self._start:
             return
         x0, y0 = self._start
-        x1, y1 = e.x, e.y
+        x1, y1 = self._end or (e.x, e.y)
         x, y = min(x0, x1), min(y0, y1)
         w, h = abs(x1 - x0), abs(y1 - y0)
         self.destroy()
@@ -124,11 +143,13 @@ class WindowPicker(tk.Toplevel):
 class CropSelector(tk.Toplevel):
     """Shows a snapshot of the picked window; drag a box to crop to a specific
     area of the app, or take the whole window. Calls on_select(crop_or_None)
-    where crop is [x, y, w, h] in window client-area pixels."""
+    where crop is [x, y, w, h] in window client-area pixels. If aspect (w/h)
+    is given, the drag is locked to that ratio."""
 
-    def __init__(self, master, snapshot, on_select):
+    def __init__(self, master, snapshot, on_select, aspect: float | None = None):
         super().__init__(master)
         self.on_select = on_select
+        self.aspect = aspect
         self.title("Select area inside window")
         self.configure(bg=BG)
         self.transient(master)
@@ -143,8 +164,10 @@ class CropSelector(tk.Toplevel):
              max(int(snapshot.height * self.scale), 1)))
         self._photo = ImageTk.PhotoImage(disp)
 
-        tk.Label(self, text="Drag a box over the area to track — or use the whole window",
-                 bg=BG, fg=FG, font=("Segoe UI", 11)).pack(pady=(10, 6))
+        hint = "Drag a box over the area to track — or use the whole window"
+        if aspect:
+            hint += "  (locked to box shape)"
+        tk.Label(self, text=hint, bg=BG, fg=FG, font=("Segoe UI", 11)).pack(pady=(10, 6))
         self.canvas = tk.Canvas(self, width=disp.width, height=disp.height,
                                 highlightthickness=0, cursor="crosshair")
         self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
@@ -161,6 +184,7 @@ class CropSelector(tk.Toplevel):
 
         self._start = None
         self._rect = None
+        self._end = None
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
@@ -173,19 +197,25 @@ class CropSelector(tk.Toplevel):
 
     def _press(self, e):
         self._start = (e.x, e.y)
+        self._end = (e.x, e.y)
         self._rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y,
                                                   outline="#ff4444", width=2)
 
     def _drag(self, e):
-        if self._rect and self._start:
-            self.canvas.coords(self._rect, *self._start, e.x, e.y)
+        if not (self._rect and self._start):
+            return
+        x1, y1 = (_locked_endpoint(*self._start, e.x, e.y, self.aspect)
+                  if self.aspect else (e.x, e.y))
+        self._end = (x1, y1)
+        self.canvas.coords(self._rect, *self._start, x1, y1)
 
     def _release(self, e):
         if not self._start:
             return
         x0, y0 = self._start
-        x, y = min(x0, e.x), min(y0, e.y)
-        w, h = abs(e.x - x0), abs(e.y - y0)
+        x1, y1 = self._end or (e.x, e.y)
+        x, y = min(x0, x1), min(y0, y1)
+        w, h = abs(x1 - x0), abs(y1 - y0)
         if w < 10 or h < 10:
             self._start = None
             if self._rect:
@@ -198,8 +228,8 @@ class CropSelector(tk.Toplevel):
 
 
 class WebsiteEntry(tk.Toplevel):
-    """Name + URL form for a hidden, auto-managed browser window region.
-    Calls on_submit(name, url)."""
+    """URL form for a hidden, auto-managed browser window region. The
+    region's name is derived from the URL. Calls on_submit(url)."""
 
     def __init__(self, master, on_submit):
         super().__init__(master)
@@ -218,11 +248,6 @@ class WebsiteEntry(tk.Toplevel):
                  bg=BG, fg=DIM, font=("Segoe UI", 9), justify="left").pack(
                      anchor="w", pady=(4, 12))
 
-        tk.Label(self, text="Name", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w")
-        self.name_entry = tk.Entry(self, width=44, bg=CARD_BG, fg=FG,
-                                   insertbackground=FG, relief="flat")
-        self.name_entry.pack(fill="x", pady=(2, 10), ipady=4)
-
         tk.Label(self, text="URL", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w")
         self.url_entry = tk.Entry(self, width=44, bg=CARD_BG, fg=FG,
                                   insertbackground=FG, relief="flat")
@@ -240,12 +265,12 @@ class WebsiteEntry(tk.Toplevel):
 
         self.bind("<Return>", lambda e: self._ok())
         self.bind("<Escape>", lambda e: self.destroy())
-        self.name_entry.focus_force()
+        self.url_entry.focus_force()
+        self.url_entry.icursor("end")
 
     def _ok(self):
-        name = self.name_entry.get().strip()
         url = self.url_entry.get().strip()
-        if not name or not url.startswith(("http://", "https://")):
+        if not url.startswith(("http://", "https://")):
             return
         self.destroy()
-        self.on_submit(name, url)
+        self.on_submit(url)

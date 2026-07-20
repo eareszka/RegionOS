@@ -1,15 +1,18 @@
-"""RegionOS dashboard: main window listing all regions with live previews."""
+"""RegionOS dashboard: a bordered grid of live-preview boxes. Empty boxes
+are click-to-add; filled boxes show a live capture with a slim control strip."""
 
+import math
 import threading
 import tkinter as tk
 from tkinter import simpledialog, messagebox
+from urllib.parse import urlparse
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 import browserlaunch
 import wincap
-from capture import make_worker, WindowCaptureWorker
-from regions import Region, RegionManager, FPS_CHOICES
+from capture import make_worker, BaseWorker, WindowCaptureWorker
+from regions import Region, RegionManager, FPS_CHOICES, GRID_CHOICES
 from selector import RegionSelector, WindowPicker, CropSelector, WebsiteEntry
 
 BG = "#1e1e1e"
@@ -17,109 +20,191 @@ CARD_BG = "#2a2a2a"
 FG = "#e0e0e0"
 DIM = "#8a8a8a"
 ACCENT = "#4a9eff"
+STRIP_BG = "#151515"
 
-PREVIEW_MAX = (360, 200)
+STATUS_COLORS = {
+    "monitoring": "#5dbb63",
+    "paused": "#e0a030",
+    "onscreen": ACCENT,
+    "note": "#e0a030",
+}
 
 
-class RegionCard(tk.Frame):
-    """One region's row in the dashboard: preview + info + controls."""
+def grid_dimensions(n: int) -> tuple[int, int]:
+    """(cols, rows) for a roughly square grid holding n boxes."""
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return cols, rows
 
-    def __init__(self, master, app, region: Region):
-        super().__init__(master, bg=CARD_BG, padx=10, pady=10)
+
+def name_from_url(url: str) -> str:
+    """A short, recognizable region name derived from a URL, e.g.
+    'https://www.google.com/search' -> 'google.com'."""
+    host = urlparse(url).netloc
+    return host[4:] if host.startswith("www.") else host or url
+
+
+def fit_cover(img: Image.Image, w: int, h: int) -> Image.Image:
+    """Scale img to fully cover a w x h box (like CSS object-fit: cover),
+    then center-crop the overflow -- fills the box exactly with no
+    letterboxing, at the cost of trimming whichever dimension overshoots."""
+    src_w, src_h = img.size
+    if src_w < 1 or src_h < 1:
+        return img
+    scale = max(w / src_w, h / src_h)
+    new_w, new_h = max(round(src_w * scale), 1), max(round(src_h * scale), 1)
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    left, top = (new_w - w) // 2, (new_h - h) // 2
+    return resized.crop((left, top, left + w, top + h))
+
+
+def fit_contain(img: Image.Image, w: int, h: int, bg: str) -> Image.Image:
+    """Scale img to fit entirely within a w x h box (like CSS object-fit:
+    contain) with no cropping, and pad the remainder with bg so it still
+    exactly fills the box -- used in non-uniform mode, where a region's
+    crop may not match its box's aspect ratio."""
+    src_w, src_h = img.size
+    if src_w < 1 or src_h < 1:
+        return Image.new("RGB", (w, h), bg)
+    scale = min(w / src_w, h / src_h)
+    new_w, new_h = max(round(src_w * scale), 1), max(round(src_h * scale), 1)
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new("RGB", (w, h), bg)
+    canvas.paste(resized, ((w - new_w) // 2, (h - new_h) // 2))
+    return canvas
+
+
+class Tile(tk.Frame):
+    """One grid box. Either empty (click to assign a region) or filled
+    (live preview + a slim strip with name, status, and controls)."""
+
+    def __init__(self, master, app, slot: int):
+        super().__init__(master, bg=CARD_BG)
         self.app = app
-        self.region = region
-        self.worker = make_worker(region)
-        self.worker.start()
+        self.slot = slot
+        self.region: Region | None = None
+        self.worker = None
         self._photo = None
         self._after_id = None
 
-        top = tk.Frame(self, bg=CARD_BG)
-        top.pack(fill="x")
-        self.name_lbl = tk.Label(top, text=region.name, bg=CARD_BG, fg=FG,
-                                 font=("Segoe UI", 12, "bold"))
-        self.name_lbl.pack(side="left")
+        # --- filled-state widgets (created once, shown/hidden via pack) ---
+        self.preview = tk.Label(self, bg=CARD_BG, bd=0, cursor="hand2")
+        self.preview.bind("<Double-Button-1>", self._on_preview_double_click)
+        self.preview.bind("<Button-3>", self._context_menu)
+
+        self.strip = tk.Frame(self, bg=STRIP_BG)
+        self.name_lbl = tk.Label(self.strip, text="", bg=STRIP_BG, fg=FG,
+                                 font=("Segoe UI", 9, "bold"), anchor="w")
+        self.name_lbl.pack(side="left", padx=(8, 6), pady=4)
         self.name_lbl.bind("<Double-Button-1>", lambda e: self.rename())
-        self.status_lbl = tk.Label(top, text="", bg=CARD_BG, fg=DIM, font=("Segoe UI", 9))
-        self.status_lbl.pack(side="right")
+        self.status_lbl = tk.Label(self.strip, text="", bg=STRIP_BG, fg=DIM,
+                                   font=("Segoe UI", 8))
+        self.status_lbl.pack(side="left")
 
-        self.preview = tk.Label(self, bg="black", width=PREVIEW_MAX[0] // 8)
-        self.preview.pack(pady=(8, 8))
-        if region.url:
-            self.preview.configure(cursor="hand2")
-            self.preview.bind("<Double-Button-1>", self.toggle_onscreen)
+        self.delete_btn = self._icon_btn(self.strip, "✕", self.delete, fg="#ff6b6b")
+        self.reselect_btn = self._icon_btn(self.strip, "⟳", self.reselect)
+        self.pause_btn = self._icon_btn(self.strip, "⏸", self.toggle_pause)
 
-        info = tk.Frame(self, bg=CARD_BG)
-        info.pack(fill="x")
-        self.geo_lbl = tk.Label(info, text="", bg=CARD_BG, fg=DIM, font=("Consolas", 9))
-        self.geo_lbl.pack(side="left")
+        self.strip.bind("<Button-3>", self._context_menu)
+        self.bind("<Button-3>", self._context_menu)
 
-        tk.Label(info, text="FPS", bg=CARD_BG, fg=DIM, font=("Segoe UI", 9)).pack(
-            side="left", padx=(16, 4))
-        self.fps_var = tk.StringVar(value=str(region.fps))
-        fps_menu = tk.OptionMenu(info, self.fps_var, *(str(f) for f in FPS_CHOICES),
-                                 command=self.set_fps)
-        fps_menu.configure(bg=CARD_BG, fg=FG, highlightthickness=0, relief="flat",
-                           activebackground=CARD_BG, activeforeground=ACCENT)
-        fps_menu["menu"].configure(bg=CARD_BG, fg=FG)
-        fps_menu.pack(side="left")
+        # --- empty-state placeholder ---
+        self.placeholder = tk.Frame(self, bg=CARD_BG, cursor="hand2")
+        self._plus_lbl = tk.Label(self.placeholder, text="+", bg=CARD_BG, fg=DIM,
+                                  font=("Segoe UI", 30))
+        self._plus_lbl.pack(expand=True, pady=(0, 2))
+        self._hint_lbl = tk.Label(self.placeholder, text="Click to add", bg=CARD_BG, fg=DIM,
+                                  font=("Segoe UI", 9))
+        self._hint_lbl.pack(pady=(0, 14))
+        for w in (self.placeholder, self._plus_lbl, self._hint_lbl):
+            w.bind("<Button-1>", self._empty_click)
+            w.bind("<Enter>", lambda e: self._placeholder_hover(True))
+            w.bind("<Leave>", lambda e: self._placeholder_hover(False))
 
-        btns = tk.Frame(self, bg=CARD_BG)
-        btns.pack(fill="x", pady=(6, 0))
-        self.pause_btn = self._button(btns, "Pause", self.toggle_pause)
-        self._button(btns, "Rename", self.rename)
-        self._button(btns, "Reselect", self.reselect)
-        self._button(btns, "Delete", self.delete, fg="#ff6b6b")
-        if region.paused:
-            self.pause_btn.configure(text="Resume")
+        self._show_empty()
 
-        self._tick()
-
-    def _button(self, parent, text, cmd, fg=FG):
-        b = tk.Button(parent, text=text, command=cmd, bg=CARD_BG, fg=fg,
-                      relief="flat", font=("Segoe UI", 9),
-                      activebackground="#3a3a3a", activeforeground=ACCENT, cursor="hand2")
-        b.pack(side="left", padx=(0, 8))
+    def _icon_btn(self, parent, text, cmd, fg=FG):
+        b = tk.Button(parent, text=text, command=cmd, bg=STRIP_BG, fg=fg, bd=0,
+                      relief="flat", font=("Segoe UI", 9), width=2,
+                      activebackground="#2a2a2a", activeforeground=ACCENT, cursor="hand2")
+        b.pack(side="right", padx=(0, 2), pady=2)
         return b
 
-    # --- live preview loop ---------------------------------------------------
+    def _placeholder_hover(self, entered):
+        fg = ACCENT if entered else DIM
+        self._plus_lbl.configure(fg=fg)
+        self._hint_lbl.configure(fg=fg)
+
+    # --- empty <-> filled state ------------------------------------------------
+
+    def _show_empty(self):
+        self.preview.pack_forget()
+        self.strip.pack_forget()
+        self.placeholder.pack(fill="both", expand=True)
+
+    def _show_filled(self):
+        self.placeholder.pack_forget()
+        self.strip.pack(fill="x", side="bottom")
+        self.preview.pack(fill="both", expand=True, side="top")
+
+    def fill(self, region: Region, hwnd=None):
+        """Attach to a region's worker (started fresh, or already running in
+        the background if this slot was just hidden by a grid resize -- see
+        Dashboard.get_or_start_worker)."""
+        self.region = region
+        self.name_lbl.configure(text=region.name)
+        self.pause_btn.configure(text="▶" if region.paused else "⏸")
+        self.worker = self.app.get_or_start_worker(region, hwnd=hwnd)
+        self._show_filled()
+        self._tick()
+
+    def clear(self):
+        """Detach this tile's view. Does NOT stop the worker -- a region
+        merely hidden by a grid resize keeps tracking in the background,
+        the same way off-screen website tracking already does regardless of
+        whether its tile is currently visible. Only delete() and app exit
+        actually stop a region's worker."""
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        self.worker = None
+        self.region = None
+        self._photo = None
+        self._show_empty()
+
+    # --- live preview loop -------------------------------------------------
 
     def _tick(self):
+        if self.region is None:
+            return
         r = self.region
         frame = self.worker.latest_frame()
         if not r.paused and frame is not None:
-            thumb = frame.copy()
-            thumb.thumbnail(PREVIEW_MAX)
+            w = max(self.preview.winfo_width(), 10)
+            h = max(self.preview.winfo_height(), 10)
+            thumb = (fit_cover(frame, w, h) if r.uniform
+                     else fit_contain(frame, w, h, CARD_BG))
             self._photo = ImageTk.PhotoImage(thumb)
-            self.preview.configure(image=self._photo, width=thumb.width,
-                                   height=thumb.height)
+            self.preview.configure(image=self._photo)
         if r.paused:
-            self.status_lbl.configure(text="Paused", fg="#e0a030")
+            self.status_lbl.configure(text="Paused", fg=STATUS_COLORS["paused"])
         elif isinstance(self.worker, WindowCaptureWorker) and self.worker.pinned_onscreen:
-            self.status_lbl.configure(text="On screen · double-click to hide", fg=ACCENT)
+            self.status_lbl.configure(text="On screen · dbl-click to hide",
+                                      fg=STATUS_COLORS["onscreen"])
         elif self.worker.note:
-            self.status_lbl.configure(text=self.worker.note, fg="#e0a030")
+            self.status_lbl.configure(text=self.worker.note, fg=STATUS_COLORS["note"])
         else:
             self.status_lbl.configure(
-                text=f"Monitoring · {min(self.worker.measured_fps, r.fps):.0f} fps",
-                fg="#5dbb63")
-        if r.mode == "window":
-            size = f"{frame.width}x{frame.height}" if frame else "—"
-            crop = "  (cropped)" if r.crop else ""
-            self.geo_lbl.configure(text=f"⊞ {r.window_title[:24]}  {size}{crop}")
-        else:
-            self.geo_lbl.configure(text=f"({r.x}, {r.y})  {r.w}x{r.h}")
+                text=f"{min(self.worker.measured_fps, r.fps):.0f} fps",
+                fg=STATUS_COLORS["monitoring"])
         interval = 500 if r.paused else max(int(1000 / r.fps), 16)
         self._after_id = self.after(interval, self._tick)
 
-    # --- controls ------------------------------------------------------------
-
-    def set_fps(self, value):
-        self.region.fps = int(value)
-        self.app.manager.save()
+    # --- filled-tile controls ------------------------------------------------
 
     def toggle_pause(self):
         self.region.paused = not self.region.paused
-        self.pause_btn.configure(text="Resume" if self.region.paused else "Pause")
+        self.pause_btn.configure(text="▶" if self.region.paused else "⏸")
         self.app.manager.save()
 
     def rename(self):
@@ -130,9 +215,17 @@ class RegionCard(tk.Frame):
             self.name_lbl.configure(text=self.region.name)
             self.app.manager.save()
 
-    def toggle_onscreen(self, event=None):
-        """Double-click the preview: bring a hidden tracked window forward
-        so the user can actually use it, or send it back off-screen."""
+    def set_fps(self, value):
+        self.region.fps = int(value)
+        self.app.manager.save()
+
+    def _on_preview_double_click(self, event=None):
+        if self.region and self.region.url:
+            self.toggle_onscreen()
+
+    def toggle_onscreen(self):
+        """Bring a hidden tracked window forward so the user can use it
+        directly, or send it back off-screen."""
         if not (isinstance(self.worker, WindowCaptureWorker) and self.worker.hwnd):
             return
         if self.worker.pinned_onscreen:
@@ -142,129 +235,281 @@ class RegionCard(tk.Frame):
             self.worker.pinned_onscreen = True
             browserlaunch.bring_onscreen(self.worker.hwnd)
 
+    def _target_aspect(self):
+        """w/h to lock crop-selection dragging to, so the result already
+        matches this box's shape -- or None for freeform selection. New
+        regions default to locked (Region.uniform defaults True); existing
+        ones follow their own per-region toggle."""
+        uniform = self.region.uniform if self.region else True
+        if not uniform:
+            return None
+        w, h = self.winfo_width(), self.winfo_height()
+        return w / h if w > 1 and h > 1 else None
+
     def reselect(self):
         if self.region.mode == "window":
-            def apply_window(title, crop):
-                self.region.window_title = title
-                self.region.crop = crop
-                if isinstance(self.worker, WindowCaptureWorker):
-                    self.worker.invalidate()
-                self.app.manager.save()
-            self.app.pick_window(apply_window)
+            hwnd = self.worker.hwnd if isinstance(self.worker, WindowCaptureWorker) else None
+            if hwnd and wincap.is_alive(hwnd):
+                # Already tracking a specific window -- recrop it directly
+                # instead of making the user find it again in the picker.
+                self._recrop(hwnd)
+            else:
+                def apply_window(title, crop):
+                    self.region.window_title = title
+                    self.region.crop = crop
+                    if isinstance(self.worker, WindowCaptureWorker):
+                        self.worker.invalidate()
+                    self.app.manager.save()
+                self.app.pick_window(apply_window, aspect=self._target_aspect())
         else:
             def apply_screen(x, y, w, h):
                 self.region.x, self.region.y = x, y
                 self.region.w, self.region.h = w, h
                 self.app.manager.save()
-            self.app.open_selector(apply_screen)
+            self.app.open_selector(apply_screen, aspect=self._target_aspect())
+
+    def _recrop(self, hwnd):
+        snapshot = wincap.grab_window(hwnd)
+        if snapshot is None:
+            messagebox.showerror(
+                "RegionOS", f'Could not capture "{self.region.name}".\n'
+                "The window may be minimized — restore it and try again.",
+                parent=self.app.root)
+            return
+
+        def apply(crop):
+            self.region.crop = crop
+            self.app.manager.save()
+        CropSelector(self.app.root, snapshot, apply, aspect=self._target_aspect())
 
     def delete(self):
         if not messagebox.askyesno("Delete region",
                                    f'Delete region "{self.region.name}"?',
                                    parent=self.app.root):
             return
-        if self.region.url and isinstance(self.worker, WindowCaptureWorker) and self.worker.hwnd:
-            wincap.close_window(self.worker.hwnd)
-        self.destroy_card()
+        self.app.stop_worker(self.region)
         self.app.manager.remove(self.region)
-        self.app.refresh_empty_state()
+        self.clear()
 
-    def destroy_card(self):
-        if self._after_id:
-            self.after_cancel(self._after_id)
-        self.worker.stop()
-        self.destroy()
+    def set_uniform(self, value: bool):
+        self.region.uniform = value
+        self.app.manager.save()
+
+    def _context_menu(self, event):
+        if self.region is None:
+            return
+        menu = tk.Menu(self.app.root, tearoff=0, bg=CARD_BG, fg=FG,
+                       activebackground=ACCENT, activeforeground="white", font=("Segoe UI", 10))
+        menu.add_command(label="Rename", command=self.rename)
+        menu.add_command(label="Reselect", command=self.reselect)
+        fps_menu = tk.Menu(menu, tearoff=0, bg=CARD_BG, fg=FG,
+                           activebackground=ACCENT, activeforeground="white", font=("Segoe UI", 10))
+        for f in FPS_CHOICES:
+            fps_menu.add_command(label=f"{f} fps", command=lambda f=f: self.set_fps(f))
+        menu.add_cascade(label="FPS", menu=fps_menu)
+        # Ephemeral BooleanVar owned by this menu instance -- fine since the
+        # menu is rebuilt fresh on every right-click, same as the rest here.
+        uniform_var = tk.BooleanVar(value=self.region.uniform)
+        menu.add_checkbutton(label="Uniform box (lock crop to box shape)", variable=uniform_var,
+                             command=lambda: self.set_uniform(uniform_var.get()),
+                             selectcolor=CARD_BG)
+        menu.add_separator()
+        menu.add_command(label="Delete", command=self.delete)
+        menu.post(event.x_root, event.y_root)
+
+    # --- empty-tile assignment -----------------------------------------------
+
+    def _empty_click(self, event):
+        menu = tk.Menu(self.app.root, tearoff=0, bg=CARD_BG, fg=FG,
+                       activebackground=ACCENT, activeforeground="white", font=("Segoe UI", 10))
+        menu.add_command(label="  Screen area — fixed rectangle on screen",
+                         command=self.assign_screen)
+        menu.add_command(label="  Application window — tracks the app even when covered",
+                         command=self.assign_window)
+        menu.add_command(label="  Website — opens hidden, tracks automatically",
+                         command=self.assign_website)
+        menu.post(event.x_root, event.y_root)
+
+    def assign_screen(self):
+        def create(x, y, w, h):
+            name = simpledialog.askstring(
+                "New region", "Region name:",
+                initialvalue=f"Region {self.slot + 1}", parent=self.app.root)
+            if name is None:
+                return
+            region = Region(name=name.strip() or f"Region {self.slot + 1}",
+                            x=x, y=y, w=w, h=h, slot=self.slot)
+            self.app.manager.add(region)
+            self.fill(region)
+        self.app.open_selector(create, aspect=self._target_aspect())
+
+    def assign_window(self):
+        def done(title, crop):
+            name = simpledialog.askstring(
+                "New region", "Region name:", initialvalue=title[:40], parent=self.app.root)
+            if name is None:
+                return
+            region = Region(name=name.strip() or title[:40], x=0, y=0, w=0, h=0,
+                            mode="window", window_title=title, crop=crop, slot=self.slot)
+            self.app.manager.add(region)
+            self.fill(region)
+        self.app.pick_window(done, aspect=self._target_aspect())
+
+    def assign_website(self):
+        def submitted(url):
+            if not browserlaunch.find_browser():
+                messagebox.showerror(
+                    "RegionOS", "Couldn't find an installed browser (Edge or Chrome).",
+                    parent=self.app.root)
+                return
+            name = name_from_url(url)
+
+            status = tk.Toplevel(self.app.root, bg=BG, padx=30, pady=24)
+            status.title("RegionOS")
+            status.transient(self.app.root)
+            status.grab_set()
+            status.resizable(False, False)
+            tk.Label(status, text=f'Opening "{name}" in a hidden window...',
+                     bg=BG, fg=FG, font=("Segoe UI", 10)).pack()
+
+            def work():
+                result = browserlaunch.launch_offscreen(url)
+                self.app.root.after(0, lambda: finish(result))
+
+            def finish(result):
+                status.destroy()
+                if not result:
+                    messagebox.showerror(
+                        "RegionOS", f'Could not open or locate the window for "{url}".\n'
+                        "Try again, or check the URL.", parent=self.app.root)
+                    return
+                hwnd, title = result
+                region = Region(name=name, x=0, y=0, w=0, h=0, mode="window",
+                                window_title=title, url=url, slot=self.slot)
+                self.app.manager.add(region)
+                self.fill(region, hwnd=hwnd)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        WebsiteEntry(self.app.root, submitted)
 
 
 class Dashboard:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.manager = RegionManager()
-        self.cards: list[RegionCard] = []
+        self.tiles: list[Tile] = []
+        # Keyed by region.id rather than slot: workers outlive their tile
+        # across grid resizes, so a hidden region keeps tracking in the
+        # background exactly like off-screen website tracking already does.
+        self.workers: dict[str, BaseWorker] = {}
 
         root.title("RegionOS")
         root.configure(bg=BG)
-        w, h = 460, 640
+        w, h = 960, 680
         x = (root.winfo_screenwidth() - w) // 2
         y = (root.winfo_screenheight() - h) // 2
         root.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
-        root.minsize(420, 300)
+        root.minsize(480, 360)
         # 99% opacity makes this a layered window. Chromium browsers pause
         # rendering when fully covered by an opaque window; layered windows
         # don't count as occluding, so pages keep animating under RegionOS.
         root.attributes("-alpha", 0.99)
 
-        header = tk.Frame(root, bg=BG, padx=14, pady=12)
+        header = tk.Frame(root, bg=BG, padx=14, pady=10)
         header.pack(fill="x")
         tk.Label(header, text="RegionOS", bg=BG, fg=FG,
                  font=("Segoe UI", 16, "bold")).pack(side="left")
-        new_btn = tk.Button(header, text="+ New Region", bg=ACCENT, fg="white",
-                            relief="flat", font=("Segoe UI", 10, "bold"),
-                            padx=12, pady=4, cursor="hand2",
-                            activebackground="#3a8eef", activeforeground="white")
-        new_btn.configure(command=lambda: self._new_region_menu(new_btn))
-        new_btn.pack(side="right")
 
-        # Scrollable card list
-        wrapper = tk.Frame(root, bg=BG)
-        wrapper.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(wrapper, bg=BG, highlightthickness=0)
-        scrollbar = tk.Scrollbar(wrapper, orient="vertical", command=self.canvas.yview)
-        self.list_frame = tk.Frame(self.canvas, bg=BG)
-        self.list_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self._window = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
-        self.canvas.bind("<Configure>",
-                         lambda e: self.canvas.itemconfigure(self._window, width=e.width))
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        root.bind_all("<MouseWheel>", self._on_wheel)
+        box_picker = tk.Frame(header, bg=BG)
+        box_picker.pack(side="right")
+        tk.Label(box_picker, text="Boxes", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(
+            side="left", padx=(0, 6))
+        self.grid_var = tk.StringVar(value=str(self.manager.grid_size))
+        grid_menu = tk.OptionMenu(box_picker, self.grid_var, *(str(n) for n in GRID_CHOICES),
+                                  command=self._on_grid_size_change)
+        grid_menu.configure(bg=CARD_BG, fg=FG, highlightthickness=0, relief="flat",
+                            activebackground=CARD_BG, activeforeground=ACCENT,
+                            font=("Segoe UI", 9), width=3)
+        grid_menu["menu"].configure(bg=CARD_BG, fg=FG)
+        grid_menu.pack(side="left")
 
-        self.empty_lbl = tk.Label(
-            self.list_frame,
-            text="No regions yet.\n\nClick  + New Region  and drag a box\nover any part of your screen.",
-            bg=BG, fg=DIM, font=("Segoe UI", 11), justify="center", pady=40)
 
-        for region in self.manager.regions:
-            self.add_card(region)
-        self.refresh_empty_state()
+        tk.Frame(root, bg=CARD_BG, height=1).pack(fill="x")
+
+        self.grid_container = tk.Frame(root, bg=BG)
+        self.grid_container.pack(fill="both", expand=True)
+
+        self.build_grid()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _on_wheel(self, e):
-        self.canvas.yview_scroll(-1 * (e.delta // 120), "units")
+    # --- grid construction -----------------------------------------------------
 
-    def refresh_empty_state(self):
-        self.cards = [c for c in self.cards if c.winfo_exists()]
-        if self.cards:
-            self.empty_lbl.pack_forget()
-        else:
-            self.empty_lbl.pack(fill="x")
+    def get_or_start_worker(self, region: Region, hwnd=None):
+        """Return the region's already-running worker, or start a new one.
+        Used both for brand-new regions and for re-attaching a Tile after a
+        grid resize brings a previously-hidden slot back into view."""
+        worker = self.workers.get(region.id)
+        if worker is not None:
+            return worker
+        worker = make_worker(region)
+        if hwnd is not None and isinstance(worker, WindowCaptureWorker):
+            worker.hwnd = hwnd
+        worker.start()
+        self.workers[region.id] = worker
+        return worker
 
-    def add_card(self, region: Region):
-        card = RegionCard(self.list_frame, self, region)
-        card.pack(fill="x", padx=14, pady=(0, 12))
-        self.cards.append(card)
+    def stop_worker(self, region: Region):
+        worker = self.workers.pop(region.id, None)
+        if worker is None:
+            return
+        if region.url and isinstance(worker, WindowCaptureWorker) and worker.hwnd:
+            wincap.close_window(worker.hwnd)
+        worker.stop()
 
-    # --- region creation -----------------------------------------------------
+    def build_grid(self):
+        for tile in self.tiles:
+            if tile._after_id:
+                tile.after_cancel(tile._after_id)
+            tile.destroy()
+        for child in self.grid_container.winfo_children():
+            child.destroy()
+        self.tiles = []
 
-    def _new_region_menu(self, button):
-        menu = tk.Menu(self.root, tearoff=0, bg=CARD_BG, fg=FG,
-                       activebackground=ACCENT, activeforeground="white",
-                       font=("Segoe UI", 10))
-        menu.add_command(label="  Screen area — fixed rectangle on screen",
-                         command=self.new_region)
-        menu.add_command(label="  Application window — tracks the app even when covered",
-                         command=self.new_window_region)
-        menu.add_command(label="  Website — opens hidden, tracks automatically",
-                         command=self.new_website_region)
-        menu.post(button.winfo_rootx(),
-                  button.winfo_rooty() + button.winfo_height() + 4)
+        # Row/column weight configuration persists on the container across
+        # rebuilds. Without clearing it first, shrinking the grid leaves
+        # leftover weighted-but-now-empty rows/columns from the previous,
+        # larger layout claiming space that belongs to the current tiles.
+        max_dim = max(max(grid_dimensions(choice)) for choice in GRID_CHOICES)
+        for i in range(max_dim):
+            self.grid_container.columnconfigure(i, weight=0, uniform="")
+            self.grid_container.rowconfigure(i, weight=0, uniform="")
 
-    def pick_window(self, on_done):
-        """WindowPicker → snapshot → CropSelector → on_done(title, crop)."""
+        n = self.manager.grid_size
+        cols, rows = grid_dimensions(n)
+        for c in range(cols):
+            self.grid_container.columnconfigure(c, weight=1, uniform="col")
+        for r in range(rows):
+            self.grid_container.rowconfigure(r, weight=1, uniform="row")
+
+        for slot in range(n):
+            row, col = divmod(slot, cols)
+            tile = Tile(self.grid_container, self, slot)
+            tile.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
+            self.tiles.append(tile)
+            region = self.manager.region_at(slot)
+            if region:
+                tile.fill(region)
+
+    def _on_grid_size_change(self, value):
+        self.manager.set_grid_size(int(value))
+        self.build_grid()
+
+    # --- shared selection helpers (used by Tile) --------------------------------
+
+    def pick_window(self, on_done, aspect: float | None = None):
+        """WindowPicker -> snapshot -> CropSelector -> on_done(title, crop)."""
         def picked(hwnd, title):
             snapshot = wincap.grab_window(hwnd)
             if snapshot is None:
@@ -273,66 +518,10 @@ class Dashboard:
                     "The window may be minimized — restore it and try again.",
                     parent=self.root)
                 return
-            CropSelector(self.root, snapshot, lambda crop: on_done(title, crop))
+            CropSelector(self.root, snapshot, lambda crop: on_done(title, crop), aspect=aspect)
         WindowPicker(self.root, picked)
 
-    def new_window_region(self):
-        def done(title, crop):
-            name = simpledialog.askstring(
-                "New region", "Region name:", initialvalue=title[:40],
-                parent=self.root)
-            if name is None:
-                return
-            region = Region(name=name.strip() or title[:40], x=0, y=0, w=0, h=0,
-                            mode="window", window_title=title, crop=crop)
-            self.manager.add(region)
-            self.add_card(region)
-            self.refresh_empty_state()
-        self.pick_window(done)
-
-    def new_website_region(self):
-        def submitted(name, url):
-            if not browserlaunch.find_browser():
-                messagebox.showerror(
-                    "RegionOS", "Couldn't find an installed browser (Edge or Chrome).",
-                    parent=self.root)
-                return
-
-            status = tk.Toplevel(self.root, bg=BG, padx=30, pady=24)
-            status.title("RegionOS")
-            status.transient(self.root)
-            status.grab_set()
-            status.resizable(False, False)
-            tk.Label(status, text=f'Opening "{name}" in a hidden window...',
-                     bg=BG, fg=FG, font=("Segoe UI", 10)).pack()
-
-            def work():
-                result = browserlaunch.launch_offscreen(url)
-                self.root.after(0, lambda: finish(result))
-
-            def finish(result):
-                status.destroy()
-                if not result:
-                    messagebox.showerror(
-                        "RegionOS", f'Could not open or locate the window for "{url}".\n'
-                        "Try again, or check the URL.", parent=self.root)
-                    return
-                hwnd, title = result
-                region = Region(name=name, x=0, y=0, w=0, h=0, mode="window",
-                                window_title=title, url=url)
-                self.manager.add(region)
-                card = RegionCard(self.list_frame, self, region)
-                if isinstance(card.worker, WindowCaptureWorker):
-                    card.worker.hwnd = hwnd
-                card.pack(fill="x", padx=14, pady=(0, 12))
-                self.cards.append(card)
-                self.refresh_empty_state()
-
-            threading.Thread(target=work, daemon=True).start()
-
-        WebsiteEntry(self.root, submitted)
-
-    def open_selector(self, on_select):
+    def open_selector(self, on_select, aspect: float | None = None):
         """Hide the dashboard, run the drag overlay, then restore."""
         self.root.withdraw()
 
@@ -340,29 +529,12 @@ class Dashboard:
             self.root.deiconify()
             on_select(x, y, w, h)
 
-        selector = RegionSelector(self.root, wrapped)
+        selector = RegionSelector(self.root, wrapped, aspect=aspect)
         selector.bind("<Destroy>", lambda e: self.root.deiconify(), add="+")
 
-    def new_region(self):
-        def create(x, y, w, h):
-            name = simpledialog.askstring(
-                "New region", "Region name:",
-                initialvalue=f"Region {len(self.manager.regions) + 1}",
-                parent=self.root)
-            if name is None:
-                return
-            region = Region(name=name.strip() or f"Region {len(self.manager.regions) + 1}",
-                            x=x, y=y, w=w, h=h)
-            self.manager.add(region)
-            self.add_card(region)
-            self.refresh_empty_state()
-        self.open_selector(create)
-
     def on_close(self):
-        for card in self.cards:
-            if card.winfo_exists():
-                card.worker.stop()
-            if (card.region.url and isinstance(card.worker, WindowCaptureWorker)
-                    and card.worker.hwnd):
-                wincap.close_window(card.worker.hwnd)
+        # Stop every tracked region, not just ones with a currently-visible
+        # tile -- a region hidden by a smaller grid size is still running.
+        for region in list(self.manager.regions):
+            self.stop_worker(region)
         self.root.destroy()
