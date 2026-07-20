@@ -20,6 +20,13 @@ user32.GetDC.argtypes = [wintypes.HWND]
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
 user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+user32.MoveWindow.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                wintypes.LPARAM]
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
@@ -36,6 +43,20 @@ gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT,
 # GPU-composited content (browsers, editors) to actually render into our DC.
 PW_FLAGS = 1 | 2
 DWMWA_CLOAKED = 14
+SW_RESTORE = 9
+WM_CLOSE = 0x0010
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+
+def virtual_screen_bounds():
+    """(x, y, w, h) of the full virtual desktop across all monitors."""
+    m = user32.GetSystemMetrics
+    return (m(SM_XVIRTUALSCREEN), m(SM_YVIRTUALSCREEN),
+            m(SM_CXVIRTUALSCREEN), m(SM_CYVIRTUALSCREEN))
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -99,6 +120,29 @@ def is_alive(hwnd) -> bool:
 
 def is_minimized(hwnd) -> bool:
     return bool(user32.IsIconic(hwnd))
+
+
+def get_window_rect(hwnd) -> tuple[int, int, int, int] | None:
+    """(left, top, right, bottom) in screen coordinates, or None on failure."""
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
+
+def restore_window(hwnd):
+    """Un-maximize/un-minimize so a subsequent move_window isn't fought by
+    the window manager."""
+    user32.ShowWindow(hwnd, SW_RESTORE)
+
+
+def move_window(hwnd, x, y, w, h):
+    return bool(user32.MoveWindow(hwnd, x, y, w, h, True))
+
+
+def close_window(hwnd):
+    """Best-effort: ask the window to close (like clicking its X)."""
+    user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
 
 
 def grab_window(hwnd) -> Image.Image | None:

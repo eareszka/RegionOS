@@ -26,6 +26,9 @@ class Region:
     window_title: str = ""
     # Optional [x, y, w, h] crop inside the window's client area
     crop: list | None = None
+    # If set, mode "window" is a RegionOS-managed hidden browser window:
+    # the capture worker relaunches it off-screen if it's ever closed.
+    url: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 

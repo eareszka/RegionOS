@@ -1,14 +1,16 @@
 """RegionOS dashboard: main window listing all regions with live previews."""
 
+import threading
 import tkinter as tk
 from tkinter import simpledialog, messagebox
 
 from PIL import ImageTk
 
+import browserlaunch
 import wincap
 from capture import make_worker, WindowCaptureWorker
 from regions import Region, RegionManager, FPS_CHOICES
-from selector import RegionSelector, WindowPicker, CropSelector
+from selector import RegionSelector, WindowPicker, CropSelector, WebsiteEntry
 
 BG = "#1e1e1e"
 CARD_BG = "#2a2a2a"
@@ -144,6 +146,8 @@ class RegionCard(tk.Frame):
                                    f'Delete region "{self.region.name}"?',
                                    parent=self.app.root):
             return
+        if self.region.url and isinstance(self.worker, WindowCaptureWorker) and self.worker.hwnd:
+            wincap.close_window(self.worker.hwnd)
         self.destroy_card()
         self.app.manager.remove(self.region)
         self.app.refresh_empty_state()
@@ -234,6 +238,8 @@ class Dashboard:
                          command=self.new_region)
         menu.add_command(label="  Application window — tracks the app even when covered",
                          command=self.new_window_region)
+        menu.add_command(label="  Website — opens hidden, tracks automatically",
+                         command=self.new_website_region)
         menu.post(button.winfo_rootx(),
                   button.winfo_rooty() + button.winfo_height() + 4)
 
@@ -263,6 +269,48 @@ class Dashboard:
             self.add_card(region)
             self.refresh_empty_state()
         self.pick_window(done)
+
+    def new_website_region(self):
+        def submitted(name, url):
+            if not browserlaunch.find_browser():
+                messagebox.showerror(
+                    "RegionOS", "Couldn't find an installed browser (Edge or Chrome).",
+                    parent=self.root)
+                return
+
+            status = tk.Toplevel(self.root, bg=BG, padx=30, pady=24)
+            status.title("RegionOS")
+            status.transient(self.root)
+            status.grab_set()
+            status.resizable(False, False)
+            tk.Label(status, text=f'Opening "{name}" in a hidden window...',
+                     bg=BG, fg=FG, font=("Segoe UI", 10)).pack()
+
+            def work():
+                result = browserlaunch.launch_offscreen(url)
+                self.root.after(0, lambda: finish(result))
+
+            def finish(result):
+                status.destroy()
+                if not result:
+                    messagebox.showerror(
+                        "RegionOS", f'Could not open or locate the window for "{url}".\n'
+                        "Try again, or check the URL.", parent=self.root)
+                    return
+                hwnd, title = result
+                region = Region(name=name, x=0, y=0, w=0, h=0, mode="window",
+                                window_title=title, url=url)
+                self.manager.add(region)
+                card = RegionCard(self.list_frame, self, region)
+                if isinstance(card.worker, WindowCaptureWorker):
+                    card.worker.hwnd = hwnd
+                card.pack(fill="x", padx=14, pady=(0, 12))
+                self.cards.append(card)
+                self.refresh_empty_state()
+
+            threading.Thread(target=work, daemon=True).start()
+
+        WebsiteEntry(self.root, submitted)
 
     def open_selector(self, on_select):
         """Hide the dashboard, run the drag overlay, then restore."""

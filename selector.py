@@ -1,24 +1,12 @@
 """Selection dialogs: fullscreen drag overlay (screen regions), window picker
 and in-window crop selector (window regions)."""
 
-import ctypes
 import tkinter as tk
 
 from PIL import ImageTk
 
 import wincap
-
-SM_XVIRTUALSCREEN = 76
-SM_YVIRTUALSCREEN = 77
-SM_CXVIRTUALSCREEN = 78
-SM_CYVIRTUALSCREEN = 79
-
-
-def virtual_screen_bounds():
-    """(x, y, w, h) of the full virtual desktop across all monitors."""
-    m = ctypes.windll.user32.GetSystemMetrics
-    return (m(SM_XVIRTUALSCREEN), m(SM_YVIRTUALSCREEN),
-            m(SM_CXVIRTUALSCREEN), m(SM_CYVIRTUALSCREEN))
+from wincap import virtual_screen_bounds
 
 
 class RegionSelector(tk.Toplevel):
@@ -207,3 +195,57 @@ class CropSelector(tk.Toplevel):
         self.destroy()
         s = self.scale
         self.on_select([int(x / s), int(y / s), int(w / s), int(h / s)])
+
+
+class WebsiteEntry(tk.Toplevel):
+    """Name + URL form for a hidden, auto-managed browser window region.
+    Calls on_submit(name, url)."""
+
+    def __init__(self, master, on_submit):
+        super().__init__(master)
+        self.on_submit = on_submit
+        self.title("Track a website")
+        self.configure(bg=BG, padx=16, pady=14)
+        self.transient(master)
+        self.grab_set()
+        self.resizable(False, False)
+
+        tk.Label(self, text="Track a website", bg=BG, fg=FG,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        tk.Label(self, text="RegionOS opens this page in a hidden browser window\n"
+                            "(off-screen, not minimized) and tracks it live —\n"
+                            "no manual tab management, nothing visible on your desktop.",
+                 bg=BG, fg=DIM, font=("Segoe UI", 9), justify="left").pack(
+                     anchor="w", pady=(4, 12))
+
+        tk.Label(self, text="Name", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w")
+        self.name_entry = tk.Entry(self, width=44, bg=CARD_BG, fg=FG,
+                                   insertbackground=FG, relief="flat")
+        self.name_entry.pack(fill="x", pady=(2, 10), ipady=4)
+
+        tk.Label(self, text="URL", bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w")
+        self.url_entry = tk.Entry(self, width=44, bg=CARD_BG, fg=FG,
+                                  insertbackground=FG, relief="flat")
+        self.url_entry.pack(fill="x", pady=(2, 4), ipady=4)
+        self.url_entry.insert(0, "https://")
+
+        btns = tk.Frame(self, bg=BG)
+        btns.pack(fill="x", pady=(12, 0))
+        tk.Button(btns, text="Track", command=self._ok, bg=ACCENT, fg="white",
+                  relief="flat", padx=14, pady=3, cursor="hand2",
+                  font=("Segoe UI", 10, "bold")).pack(side="right")
+        tk.Button(btns, text="Cancel", command=self.destroy, bg=CARD_BG, fg=FG,
+                  relief="flat", padx=14, pady=3, cursor="hand2",
+                  font=("Segoe UI", 10)).pack(side="right", padx=(0, 8))
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.name_entry.focus_force()
+
+    def _ok(self):
+        name = self.name_entry.get().strip()
+        url = self.url_entry.get().strip()
+        if not name or not url.startswith(("http://", "https://")):
+            return
+        self.destroy()
+        self.on_submit(name, url)

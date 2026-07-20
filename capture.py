@@ -14,7 +14,10 @@ import mss
 from mss.exception import ScreenShotError
 from PIL import Image
 
+import browserlaunch
 import wincap
+
+RELAUNCH_COOLDOWN_S = 5.0
 
 
 class BaseWorker(threading.Thread):
@@ -69,6 +72,7 @@ class WindowCaptureWorker(BaseWorker):
     def __init__(self, region, hwnd: int | None = None):
         super().__init__(region)
         self.hwnd = hwnd
+        self._last_relaunch = 0.0
 
     def invalidate(self):
         """Force a re-find of the window (after Reselect)."""
@@ -82,6 +86,17 @@ class WindowCaptureWorker(BaseWorker):
                 continue
             if not self.hwnd or not wincap.is_alive(self.hwnd):
                 self.hwnd = wincap.find_window(r.window_title)
+                if not self.hwnd and r.url:
+                    now = time.monotonic()
+                    if now - self._last_relaunch >= RELAUNCH_COOLDOWN_S:
+                        self._last_relaunch = now
+                        self.note = "Reopening hidden window..."
+                        found = browserlaunch.launch_offscreen(r.url)
+                        if found:
+                            self.hwnd, r.window_title = found
+                    else:
+                        time.sleep(0.5)
+                        continue
                 if not self.hwnd:
                     self.note = "Window not found"
                     time.sleep(1.0)
@@ -90,6 +105,10 @@ class WindowCaptureWorker(BaseWorker):
                 self.note = "Minimized — showing last frame"
                 time.sleep(0.5)
                 continue
+            if r.url and not browserlaunch.is_offscreen(self.hwnd):
+                # The browser re-asserted its own remembered window bounds;
+                # keep the hidden window actually hidden.
+                browserlaunch.push_offscreen(self.hwnd)
             start = time.perf_counter()
             img = wincap.grab_window(self.hwnd)
             if img is None:
