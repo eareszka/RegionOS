@@ -44,6 +44,9 @@ class RegionCard(tk.Frame):
 
         self.preview = tk.Label(self, bg="black", width=PREVIEW_MAX[0] // 8)
         self.preview.pack(pady=(8, 8))
+        if region.url:
+            self.preview.configure(cursor="hand2")
+            self.preview.bind("<Double-Button-1>", self.toggle_onscreen)
 
         info = tk.Frame(self, bg=CARD_BG)
         info.pack(fill="x")
@@ -91,6 +94,8 @@ class RegionCard(tk.Frame):
                                    height=thumb.height)
         if r.paused:
             self.status_lbl.configure(text="Paused", fg="#e0a030")
+        elif isinstance(self.worker, WindowCaptureWorker) and self.worker.pinned_onscreen:
+            self.status_lbl.configure(text="On screen · double-click to hide", fg=ACCENT)
         elif self.worker.note:
             self.status_lbl.configure(text=self.worker.note, fg="#e0a030")
         else:
@@ -124,6 +129,18 @@ class RegionCard(tk.Frame):
             self.region.name = name.strip()
             self.name_lbl.configure(text=self.region.name)
             self.app.manager.save()
+
+    def toggle_onscreen(self, event=None):
+        """Double-click the preview: bring a hidden tracked window forward
+        so the user can actually use it, or send it back off-screen."""
+        if not (isinstance(self.worker, WindowCaptureWorker) and self.worker.hwnd):
+            return
+        if self.worker.pinned_onscreen:
+            self.worker.pinned_onscreen = False
+            browserlaunch.push_offscreen(self.worker.hwnd)
+        else:
+            self.worker.pinned_onscreen = True
+            browserlaunch.bring_onscreen(self.worker.hwnd)
 
     def reselect(self):
         if self.region.mode == "window":
@@ -167,7 +184,10 @@ class Dashboard:
 
         root.title("RegionOS")
         root.configure(bg=BG)
-        root.geometry("460x640")
+        w, h = 460, 640
+        x = (root.winfo_screenwidth() - w) // 2
+        y = (root.winfo_screenheight() - h) // 2
+        root.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
         root.minsize(420, 300)
         # 99% opacity makes this a layered window. Chromium browsers pause
         # rendering when fully covered by an opaque window; layered windows
@@ -342,4 +362,7 @@ class Dashboard:
         for card in self.cards:
             if card.winfo_exists():
                 card.worker.stop()
+            if (card.region.url and isinstance(card.worker, WindowCaptureWorker)
+                    and card.worker.hwnd):
+                wincap.close_window(card.worker.hwnd)
         self.root.destroy()

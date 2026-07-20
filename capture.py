@@ -73,6 +73,7 @@ class WindowCaptureWorker(BaseWorker):
         super().__init__(region)
         self.hwnd = hwnd
         self._last_relaunch = 0.0
+        self.pinned_onscreen = False  # user brought a hidden window forward to use it
 
     def invalidate(self):
         """Force a re-find of the window (after Reselect)."""
@@ -102,12 +103,21 @@ class WindowCaptureWorker(BaseWorker):
                     time.sleep(1.0)
                     continue
             if wincap.is_minimized(self.hwnd):
+                if r.url and self.pinned_onscreen:
+                    # Minimizing a window the user brought forward reads as
+                    # "I'm done with it" -- send it back to hidden tracking
+                    # instead of freezing capture on the last frame.
+                    self.pinned_onscreen = False
+                    wincap.restore_window(self.hwnd)
+                    browserlaunch.push_offscreen(self.hwnd)
+                    continue
                 self.note = "Minimized — showing last frame"
                 time.sleep(0.5)
                 continue
-            if r.url and not browserlaunch.is_offscreen(self.hwnd):
+            if r.url and not self.pinned_onscreen and not browserlaunch.is_offscreen(self.hwnd):
                 # The browser re-asserted its own remembered window bounds;
-                # keep the hidden window actually hidden.
+                # keep the hidden window actually hidden. Skipped while
+                # pinned_onscreen -- the user brought it forward on purpose.
                 browserlaunch.push_offscreen(self.hwnd)
             start = time.perf_counter()
             img = wincap.grab_window(self.hwnd)

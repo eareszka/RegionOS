@@ -27,6 +27,9 @@ user32.MoveWindow.restype = wintypes.BOOL
 user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                                 wintypes.LPARAM]
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
@@ -102,6 +105,8 @@ def find_window(title: str) -> int | None:
     """Best-effort re-find of a window by remembered title: exact match first,
     then case-insensitive containment either way (titles drift, e.g. editors
     append the open file name)."""
+    if not title:
+        return None
     windows = list_windows()
     for hwnd, t in windows:
         if t == title:
@@ -116,6 +121,14 @@ def find_window(title: str) -> int | None:
 
 def is_alive(hwnd) -> bool:
     return bool(user32.IsWindow(hwnd))
+
+
+def get_window_pid(hwnd) -> int | None:
+    """PID of the process that owns hwnd, or None on failure."""
+    pid = wintypes.DWORD(0)
+    if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
+        return None
+    return pid.value
 
 
 def is_minimized(hwnd) -> bool:
@@ -134,6 +147,15 @@ def restore_window(hwnd):
     """Un-maximize/un-minimize so a subsequent move_window isn't fought by
     the window manager."""
     user32.ShowWindow(hwnd, SW_RESTORE)
+
+
+def focus_window(hwnd):
+    """Bring hwnd to the front and give it input focus. Windows normally
+    blocks a background process from stealing focus, but that restriction
+    doesn't apply here: this is only ever called from RegionOS's own window
+    procedure in direct response to a real user click, which is exactly the
+    condition Windows allows."""
+    user32.SetForegroundWindow(hwnd)
 
 
 def move_window(hwnd, x, y, w, h):
