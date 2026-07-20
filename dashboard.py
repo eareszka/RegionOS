@@ -271,12 +271,14 @@ class Tile(tk.Frame):
             self.worker.pinned_onscreen = True
             browserlaunch.bring_onscreen(self.worker.hwnd)
 
-    def _target_aspect(self):
+    def _target_aspect(self, default: bool = True):
         """w/h to lock crop-selection dragging to, so the result already
         matches this box's shape -- or None for freeform selection. New
-        regions default to locked (Region.uniform defaults True); existing
-        ones follow their own per-region toggle."""
-        uniform = self.region.uniform if self.region else True
+        regions use `default` (screen regions default to locked; window
+        regions default to freeform since a window's whole content is
+        usually what you want to see); existing ones follow their own
+        per-region toggle."""
+        uniform = self.region.uniform if self.region else default
         if not uniform:
             return None
         w, h = self.winfo_width(), self.winfo_height()
@@ -386,10 +388,11 @@ class Tile(tk.Frame):
             if name is None:
                 return
             region = Region(name=name.strip() or title[:40], x=0, y=0, w=0, h=0,
-                            mode="window", window_title=title, crop=crop, slot=self.slot)
+                            mode="window", window_title=title, crop=crop, slot=self.slot,
+                            uniform=False)
             self.app.manager.add(region)
             self.fill(region)
-        self.app.pick_window(done, aspect=self._target_aspect())
+        self.app.pick_window(done, aspect=self._target_aspect(default=False))
 
     def assign_website(self):
         WebsiteEntry(self.app.root, self._launch_website)
@@ -426,7 +429,7 @@ class Tile(tk.Frame):
                 return
             hwnd, title = result
             region = Region(name=name, x=0, y=0, w=0, h=0, mode="window",
-                            window_title=title, url=url, slot=self.slot)
+                            window_title=title, url=url, slot=self.slot, uniform=False)
             self.app.manager.add(region)
             self.fill(region, hwnd=hwnd)
 
@@ -463,10 +466,11 @@ class Tile(tk.Frame):
             if name is None:
                 return
             region = Region(name=name.strip() or title[:40], x=0, y=0, w=0, h=0,
-                            mode="window", window_title=title, crop=crop, slot=self.slot)
+                            mode="window", window_title=title, crop=crop, slot=self.slot,
+                            uniform=False)
             self.app.manager.add(region)
             self.fill(region)
-        CropSelector(self.app.root, snapshot, apply, aspect=self._target_aspect())
+        CropSelector(self.app.root, snapshot, apply, aspect=self._target_aspect(default=False))
 
     def _assign_from_browser_drop(self, hwnd):
         """Dropped onto a browser window: read its URL and relaunch it
