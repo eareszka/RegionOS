@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageTk
 
+import address_bar
 import browserlaunch
 import wincap
 from capture import make_worker, BaseWorker, WindowCaptureWorker
@@ -116,8 +117,12 @@ class Tile(tk.Frame):
         self._hint_lbl = tk.Label(self.placeholder, text="Click to add", bg=CARD_BG, fg=DIM,
                                   font=("Segoe UI", 9))
         self._hint_lbl.pack(pady=(0, 14))
+        self._drag_origin = None
+        self._dragging_pick = False
         for w in (self.placeholder, self._plus_lbl, self._hint_lbl):
-            w.bind("<Button-1>", self._empty_click)
+            w.bind("<ButtonPress-1>", self._placeholder_press)
+            w.bind("<B1-Motion>", self._placeholder_motion)
+            w.bind("<ButtonRelease-1>", self._placeholder_release)
             w.bind("<Enter>", lambda e: self._placeholder_hover(True))
             w.bind("<Leave>", lambda e: self._placeholder_hover(False))
 
@@ -134,6 +139,37 @@ class Tile(tk.Frame):
         fg = ACCENT if entered else DIM
         self._plus_lbl.configure(fg=fg)
         self._hint_lbl.configure(fg=fg)
+
+    # --- empty-tile click vs. drag-to-pick disambiguation -----------------------
+
+    DRAG_THRESHOLD = 6
+
+    def _placeholder_press(self, event):
+        self._drag_origin = (event.x_root, event.y_root)
+        self._dragging_pick = False
+
+    def _placeholder_motion(self, event):
+        if self._drag_origin is None or self._dragging_pick:
+            return
+        dx = event.x_root - self._drag_origin[0]
+        dy = event.y_root - self._drag_origin[1]
+        if abs(dx) > self.DRAG_THRESHOLD or abs(dy) > self.DRAG_THRESHOLD:
+            self._dragging_pick = True
+            for w in (self.placeholder, self._plus_lbl, self._hint_lbl):
+                w.configure(cursor="target")
+            self._hint_lbl.configure(text="Release over a window to track it")
+
+    def _placeholder_release(self, event):
+        was_dragging = self._dragging_pick
+        self._drag_origin = None
+        self._dragging_pick = False
+        for w in (self.placeholder, self._plus_lbl, self._hint_lbl):
+            w.configure(cursor="hand2")
+        self._hint_lbl.configure(text="Click to add")
+        if was_dragging:
+            self._pick_by_drag(event.x_root, event.y_root)
+        else:
+            self._empty_click(event)
 
     # --- empty <-> filled state ------------------------------------------------
 
@@ -356,42 +392,110 @@ class Tile(tk.Frame):
         self.app.pick_window(done, aspect=self._target_aspect())
 
     def assign_website(self):
-        def submitted(url):
-            if not browserlaunch.find_browser():
+        WebsiteEntry(self.app.root, self._launch_website)
+
+    def _launch_website(self, url):
+        """Launch url in the hidden, isolated-profile window and assign it
+        to this box. Shared by the "Website" menu item and the drag-a-tab
+        flow below, once the latter has extracted a URL."""
+        if not browserlaunch.find_browser():
+            messagebox.showerror(
+                "RegionOS", "Couldn't find an installed browser (Edge or Chrome).",
+                parent=self.app.root)
+            return
+        name = name_from_url(url)
+
+        status = tk.Toplevel(self.app.root, bg=BG, padx=30, pady=24)
+        status.title("RegionOS")
+        status.transient(self.app.root)
+        status.grab_set()
+        status.resizable(False, False)
+        tk.Label(status, text=f'Opening "{name}" in a hidden window...',
+                 bg=BG, fg=FG, font=("Segoe UI", 10)).pack()
+
+        def work():
+            result = browserlaunch.launch_offscreen(url)
+            self.app.root.after(0, lambda: finish(result))
+
+        def finish(result):
+            status.destroy()
+            if not result:
                 messagebox.showerror(
-                    "RegionOS", "Couldn't find an installed browser (Edge or Chrome).",
-                    parent=self.app.root)
+                    "RegionOS", f'Could not open or locate the window for "{url}".\n'
+                    "Try again, or check the URL.", parent=self.app.root)
                 return
-            name = name_from_url(url)
+            hwnd, title = result
+            region = Region(name=name, x=0, y=0, w=0, h=0, mode="window",
+                            window_title=title, url=url, slot=self.slot)
+            self.app.manager.add(region)
+            self.fill(region, hwnd=hwnd)
 
-            status = tk.Toplevel(self.app.root, bg=BG, padx=30, pady=24)
-            status.title("RegionOS")
-            status.transient(self.app.root)
-            status.grab_set()
-            status.resizable(False, False)
-            tk.Label(status, text=f'Opening "{name}" in a hidden window...',
-                     bg=BG, fg=FG, font=("Segoe UI", 10)).pack()
+        threading.Thread(target=work, daemon=True).start()
 
-            def work():
-                result = browserlaunch.launch_offscreen(url)
-                self.app.root.after(0, lambda: finish(result))
+    # --- drag-to-pick: drag from this box's placeholder onto any window --------
 
-            def finish(result):
-                status.destroy()
-                if not result:
-                    messagebox.showerror(
-                        "RegionOS", f'Could not open or locate the window for "{url}".\n'
-                        "Try again, or check the URL.", parent=self.app.root)
-                    return
-                hwnd, title = result
-                region = Region(name=name, x=0, y=0, w=0, h=0, mode="window",
-                                window_title=title, url=url, slot=self.slot)
-                self.app.manager.add(region)
-                self.fill(region, hwnd=hwnd)
+    def _pick_by_drag(self, x_root, y_root):
+        hwnd = wincap.window_from_point(x_root, y_root)
+        if (not hwnd or not wincap.is_alive(hwnd)
+                or wincap.get_window_title(hwnd) == "RegionOS"):
+            return
+        if browserlaunch.is_browser_window(hwnd):
+            self._assign_from_browser_drop(hwnd)
+        else:
+            self._assign_from_window_drop(hwnd)
 
-            threading.Thread(target=work, daemon=True).start()
+    def _assign_from_window_drop(self, hwnd):
+        """Dropped onto a non-browser window: track it directly, same as
+        the "Application window" picker but without re-picking from a list
+        since the drag itself already identified the window."""
+        title = wincap.get_window_title(hwnd)
+        snapshot = wincap.grab_window(hwnd)
+        if snapshot is None:
+            messagebox.showerror(
+                "RegionOS", f'Could not capture "{title}".\n'
+                "The window may be minimized — restore it and try again.",
+                parent=self.app.root)
+            return
 
-        WebsiteEntry(self.app.root, submitted)
+        def apply(crop):
+            name = simpledialog.askstring(
+                "New region", "Region name:", initialvalue=title[:40], parent=self.app.root)
+            if name is None:
+                return
+            region = Region(name=name.strip() or title[:40], x=0, y=0, w=0, h=0,
+                            mode="window", window_title=title, crop=crop, slot=self.slot)
+            self.app.manager.add(region)
+            self.fill(region)
+        CropSelector(self.app.root, snapshot, apply, aspect=self._target_aspect())
+
+    def _assign_from_browser_drop(self, hwnd):
+        """Dropped onto a browser window: read its URL and relaunch it
+        through the safe, isolated-profile pipeline instead of pushing the
+        user's actual regular-profile window off-screen -- doing that could
+        poison that profile's saved window position the same way the
+        original off-screen bug did."""
+        status = tk.Toplevel(self.app.root, bg=BG, padx=30, pady=24)
+        status.title("RegionOS")
+        status.transient(self.app.root)
+        status.grab_set()
+        status.resizable(False, False)
+        tk.Label(status, text="Reading the tab's URL...",
+                 bg=BG, fg=FG, font=("Segoe UI", 10)).pack()
+
+        def work():
+            url = address_bar.get_url(hwnd)
+            self.app.root.after(0, lambda: got_url(url))
+
+        def got_url(url):
+            status.destroy()
+            if not url or not url.startswith(("http://", "https://")):
+                messagebox.showerror(
+                    "RegionOS", "Couldn't read a URL from that window.\n"
+                    'Use "Website" from this box\'s menu instead.', parent=self.app.root)
+                return
+            self._launch_website(url)
+
+        threading.Thread(target=work, daemon=True).start()
 
 
 class Dashboard:

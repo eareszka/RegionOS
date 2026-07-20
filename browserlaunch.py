@@ -40,6 +40,7 @@ WINDOW_SIZE = (1280, 800)
 OFFSCREEN_MARGIN = 50
 FIND_TIMEOUT_S = 8.0
 POLL_INTERVAL_S = 0.15
+MIN_WINDOW_DIM = 300  # filters out small notification/dialog popups
 
 PROFILE_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "RegionOS", "BrowserProfile")
@@ -67,6 +68,16 @@ def _owning_exe_path(hwnd) -> str | None:
         return buf.value
     finally:
         kernel32.CloseHandle(handle)
+
+
+def owning_exe_name(hwnd) -> str | None:
+    """Lowercase basename of the executable owning hwnd, or None."""
+    path = _owning_exe_path(hwnd)
+    return os.path.basename(path).lower() if path else None
+
+
+def is_browser_window(hwnd) -> bool:
+    return owning_exe_name(hwnd) in BROWSER_EXES
 
 
 def find_browser() -> str | None:
@@ -150,9 +161,14 @@ def launch_offscreen(url: str, browser_exe: str | None = None) -> tuple[int, str
         # --new-window via IPC in its own pre-existing process). Without
         # this check, any unrelated window that happens to appear during
         # the poll — even RegionOS's own dashboard — could be mistaken for
-        # the new browser window.
+        # the new browser window. Also require a real window-sized rect,
+        # since the browser can pop up small owned windows of its own around
+        # the same time (e.g. a "Restore pages" prompt after an unclean
+        # shutdown) that would otherwise pass the exe-path check too.
         matches = [h for h in new
-                   if (path := _owning_exe_path(h)) and path.lower() == browser_exe.lower()]
+                   if (path := _owning_exe_path(h)) and path.lower() == browser_exe.lower()
+                   and (rect := wincap.get_window_rect(h))
+                   and rect[2] - rect[0] >= MIN_WINDOW_DIM and rect[3] - rect[1] >= MIN_WINDOW_DIM]
         if matches:
             hwnd = matches[0]
             break

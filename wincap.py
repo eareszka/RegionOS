@@ -30,6 +30,10 @@ user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.WindowFromPoint.argtypes = [wintypes.POINT]
+user32.WindowFromPoint.restype = wintypes.HWND
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
@@ -48,6 +52,7 @@ PW_FLAGS = 1 | 2
 DWMWA_CLOAKED = 14
 SW_RESTORE = 9
 WM_CLOSE = 0x0010
+GA_ROOT = 2
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -121,6 +126,25 @@ def find_window(title: str) -> int | None:
 
 def is_alive(hwnd) -> bool:
     return bool(user32.IsWindow(hwnd))
+
+
+def get_window_title(hwnd) -> str:
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length == 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def window_from_point(x, y) -> int | None:
+    """Top-level window at screen coordinates (x, y), or None. Used to
+    figure out what the user dragged onto during a pick-by-drag gesture."""
+    hwnd = user32.WindowFromPoint(wintypes.POINT(x, y))
+    if not hwnd:
+        return None
+    root = user32.GetAncestor(hwnd, GA_ROOT)
+    return int(root) if root else int(hwnd)
 
 
 def get_window_pid(hwnd) -> int | None:
