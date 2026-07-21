@@ -126,10 +126,11 @@ ONSCREEN_POSITION = (60, 60)
 
 
 def bring_onscreen(hwnd):
-    """Move a hidden tracked window onto the primary monitor and focus it,
-    so the user can use it like a normal browser window. The capture loop
-    checks WindowCaptureWorker.pinned_onscreen and skips re-hiding it while
-    this is in effect; push_offscreen (via the same flag) puts it back."""
+    """Move a hidden or covered tracked window onto the primary monitor and
+    focus it, so the user can use it directly -- any window-mode region,
+    not just RegionOS-managed websites. The capture loop checks
+    WindowCaptureWorker.pinned_onscreen and skips re-hiding it while this
+    is in effect; push_offscreen (via the same flag) puts it back."""
     w, h = WINDOW_SIZE
     wincap.restore_window(hwnd)
     wincap.move_window(hwnd, *ONSCREEN_POSITION, w, h)

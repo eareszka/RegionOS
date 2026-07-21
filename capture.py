@@ -103,10 +103,11 @@ class WindowCaptureWorker(BaseWorker):
                     time.sleep(1.0)
                     continue
             if wincap.is_minimized(self.hwnd):
-                if r.url and self.pinned_onscreen:
+                if self.pinned_onscreen:
                     # Minimizing a window the user brought forward reads as
                     # "I'm done with it" -- send it back to hidden tracking
-                    # instead of freezing capture on the last frame.
+                    # instead of freezing capture on the last frame. Applies
+                    # to any tracked window, not just managed websites.
                     self.pinned_onscreen = False
                     wincap.restore_window(self.hwnd)
                     browserlaunch.push_offscreen(self.hwnd)

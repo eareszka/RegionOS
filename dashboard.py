@@ -158,6 +158,11 @@ class Tile(tk.Frame):
             for w in (self.placeholder, self._plus_lbl, self._hint_lbl):
                 w.configure(cursor="target")
             self._hint_lbl.configure(text="Release over a window to track it")
+            # The initial click already raised us (normal OS click-to-focus
+            # behavior) -- drop back behind other windows so the app you're
+            # about to drag onto, usually on the same screen, is reachable
+            # instead of hidden under our own window.
+            self.app.root.lower()
 
     def _placeholder_release(self, event):
         was_dragging = self._dragging_pick
@@ -256,7 +261,7 @@ class Tile(tk.Frame):
         self.app.manager.save()
 
     def _on_preview_double_click(self, event=None):
-        if self.region and self.region.url:
+        if self.region and self.region.mode == "window":
             self.toggle_onscreen()
 
     def toggle_onscreen(self):
@@ -441,6 +446,10 @@ class Tile(tk.Frame):
         hwnd = wincap.window_from_point(x_root, y_root)
         if (not hwnd or not wincap.is_alive(hwnd)
                 or wincap.get_window_title(hwnd) == "RegionOS"):
+            # Nothing usable under the cursor -- we already lowered
+            # ourselves for the drag, so raise back up rather than leaving
+            # the app stuck behind whatever's on screen.
+            self.app.root.lift()
             return
         if browserlaunch.is_browser_window(hwnd):
             self._assign_from_browser_drop(hwnd)
@@ -450,7 +459,11 @@ class Tile(tk.Frame):
     def _assign_from_window_drop(self, hwnd):
         """Dropped onto a non-browser window: track it directly, same as
         the "Application window" picker but without re-picking from a list
-        since the drag itself already identified the window."""
+        since the drag itself already identified the window. Like a
+        dropped browser tab, the window disappears off-screen the moment
+        you drop it -- RegionOS keeps capturing it there, and
+        double-clicking the tile (or minimizing the window back) brings it
+        forward or hides it again, same as a tracked website."""
         title = wincap.get_window_title(hwnd)
         snapshot = wincap.grab_window(hwnd)
         if snapshot is None:
@@ -459,6 +472,7 @@ class Tile(tk.Frame):
                 "The window may be minimized — restore it and try again.",
                 parent=self.app.root)
             return
+        browserlaunch.push_offscreen(hwnd)
 
         def apply(crop):
             name = simpledialog.askstring(
@@ -469,7 +483,7 @@ class Tile(tk.Frame):
                             mode="window", window_title=title, crop=crop, slot=self.slot,
                             uniform=False)
             self.app.manager.add(region)
-            self.fill(region)
+            self.fill(region, hwnd=hwnd)
         CropSelector(self.app.root, snapshot, apply, aspect=self._target_aspect(default=False))
 
     def _assign_from_browser_drop(self, hwnd):
