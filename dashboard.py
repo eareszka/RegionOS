@@ -271,7 +271,7 @@ class Tile(tk.Frame):
             return
         if self.worker.pinned_onscreen:
             self.worker.pinned_onscreen = False
-            browserlaunch.push_offscreen(self.worker.hwnd)
+            browserlaunch.push_offscreen(self.worker.hwnd, offset_index=self.region.slot)
         else:
             self.worker.pinned_onscreen = True
             browserlaunch.bring_onscreen(self.worker.hwnd)
@@ -402,10 +402,12 @@ class Tile(tk.Frame):
     def assign_website(self):
         WebsiteEntry(self.app.root, self._launch_website)
 
-    def _launch_website(self, url):
+    def _launch_website(self, url, close_hwnd=None):
         """Launch url in the hidden, isolated-profile window and assign it
-        to this box. Shared by the "Website" menu item and the drag-a-tab
-        flow below, once the latter has extracted a URL."""
+        to this box. If close_hwnd is given (the real browser window this
+        URL was read from, e.g. a dragged tab), it's closed only once the
+        isolated copy is confirmed up and tracking -- never before, so a
+        failed launch doesn't lose the user's original window/tab."""
         if not browserlaunch.find_browser():
             messagebox.showerror(
                 "RegionOS", "Couldn't find an installed browser (Edge or Chrome).",
@@ -422,7 +424,7 @@ class Tile(tk.Frame):
                  bg=BG, fg=FG, font=("Segoe UI", 10)).pack()
 
         def work():
-            result = browserlaunch.launch_offscreen(url)
+            result = browserlaunch.launch_offscreen(url, offset_index=self.slot)
             self.app.root.after(0, lambda: finish(result))
 
         def finish(result):
@@ -437,6 +439,8 @@ class Tile(tk.Frame):
                             window_title=title, url=url, slot=self.slot, uniform=False)
             self.app.manager.add(region)
             self.fill(region, hwnd=hwnd)
+            if close_hwnd and wincap.is_alive(close_hwnd):
+                wincap.close_window(close_hwnd)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -459,11 +463,13 @@ class Tile(tk.Frame):
     def _assign_from_window_drop(self, hwnd):
         """Dropped onto a non-browser window: track it directly, same as
         the "Application window" picker but without re-picking from a list
-        since the drag itself already identified the window. Like a
-        dropped browser tab, the window disappears off-screen the moment
-        you drop it -- RegionOS keeps capturing it there, and
-        double-clicking the tile (or minimizing the window back) brings it
-        forward or hides it again, same as a tracked website."""
+        since the drag itself already identified the window. The window
+        disappears off-screen the moment you drop it -- RegionOS keeps
+        capturing it there, and double-clicking the tile (or minimizing
+        the window back) brings it forward or hides it again. This window
+        is never closed by RegionOS -- only ever restored back on-screen
+        (see Dashboard.stop_worker) -- since it's the user's own, not one
+        we spawned."""
         title = wincap.get_window_title(hwnd)
         snapshot = wincap.grab_window(hwnd)
         if snapshot is None:
@@ -472,7 +478,7 @@ class Tile(tk.Frame):
                 "The window may be minimized — restore it and try again.",
                 parent=self.app.root)
             return
-        browserlaunch.push_offscreen(hwnd)
+        browserlaunch.push_offscreen(hwnd, offset_index=self.slot)
 
         def apply(crop):
             name = simpledialog.askstring(
@@ -488,10 +494,18 @@ class Tile(tk.Frame):
 
     def _assign_from_browser_drop(self, hwnd):
         """Dropped onto a browser window: read its URL and relaunch it
-        through the safe, isolated-profile pipeline instead of pushing the
-        user's actual regular-profile window off-screen -- doing that could
-        poison that profile's saved window position the same way the
-        original off-screen bug did."""
+        through the isolated-profile pipeline instead of tracking the
+        user's actual regular-profile window directly. Tracking a real
+        browser window directly was tried and reverted: pushing it
+        off-screen still leaves it as the "last" window of that browser
+        process, so any *other*, unrelated new window the user opens
+        afterward (Ctrl+N, a link, anything) gets cascade-positioned by
+        Chromium relative to it and lands mostly off-screen too --
+        confirmed directly, not theoretical. A separate, isolated process
+        never has the user's regular windows in view, so this can't
+        happen. Once the isolated copy is confirmed up and tracking, the
+        original tab/window is closed -- the user dragged it here to
+        replace it, not to keep a duplicate live."""
         status = tk.Toplevel(self.app.root, bg=BG, padx=30, pady=24)
         status.title("RegionOS")
         status.transient(self.app.root)
@@ -511,7 +525,7 @@ class Tile(tk.Frame):
                     "RegionOS", "Couldn't read a URL from that window.\n"
                     'Use "Website" from this box\'s menu instead.', parent=self.app.root)
                 return
-            self._launch_website(url)
+            self._launch_website(url, close_hwnd=hwnd)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -525,6 +539,7 @@ class Dashboard:
         # across grid resizes, so a hidden region keeps tracking in the
         # background exactly like off-screen website tracking already does.
         self.workers: dict[str, BaseWorker] = {}
+        self._restore_cascade = 0  # offsets successive stop_worker restores
 
         root.title("RegionOS")
         root.configure(bg=BG)
@@ -586,8 +601,19 @@ class Dashboard:
         worker = self.workers.pop(region.id, None)
         if worker is None:
             return
-        if region.url and isinstance(worker, WindowCaptureWorker) and worker.hwnd:
-            wincap.close_window(worker.hwnd)
+        if isinstance(worker, WindowCaptureWorker) and worker.hwnd and wincap.is_alive(worker.hwnd):
+            if region.url:
+                # A RegionOS-managed hidden website -- our window to close.
+                wincap.close_window(worker.hwnd)
+            elif browserlaunch.is_offscreen(worker.hwnd):
+                # The user's own window (e.g. a drag-tracked app or real
+                # browser), currently hidden off-screen -- never ours to
+                # close, but it must not be left stranded off-screen once
+                # nothing is tracking it anymore. Cascade so restoring
+                # several at once (e.g. on app exit) doesn't stack them
+                # exactly on top of each other.
+                browserlaunch.restore_to_visible(worker.hwnd, self._restore_cascade)
+                self._restore_cascade += 1
         worker.stop()
 
     def build_grid(self):

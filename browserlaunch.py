@@ -17,10 +17,20 @@ The window is positioned outside the virtual desktop rather than minimized:
 Windows still fully renders off-screen windows (only minimizing or covering
 stops rendering), so the same PrintWindow capture used for normal
 Application-window regions keeps working, while the window never appears
-on screen or clutters the desktop. Every tracked window is pushed to the
-same off-screen spot (see push_offscreen), stacked on top of each other;
-LAUNCH_FLAGS disables Chromium's occlusion-based pause so all of them keep
-rendering live regardless of stacking order.
+on screen or clutters the desktop -- except for a SLIVER_PX-wide sliver
+deliberately left on-screen at the desktop edge (see push_offscreen):
+measured directly, a window with *zero* on-screen pixels gets composited
+by DWM at visibly lower fidelity for GPU-accelerated content (e.g. video
+looks blurry) even though it keeps updating; a 1-2px sliver is enough to
+keep it at full quality while remaining imperceptible. Each tracked
+window's sliver is staggered vertically by offset_index (see
+Region.slot) so simultaneously-hidden windows don't land on the exact
+same coordinates and occlude each other -- which would undo the benefit
+for whichever one ends up underneath. LAUNCH_FLAGS additionally disables
+Chromium's occlusion-based pause, for the RegionOS-managed windows that
+get relaunched with it (real, regular-profile browser windows tracked
+directly can't have flags applied after the fact, which is exactly why
+the sliver -- not just the flags -- is what keeps their quality up).
 """
 
 import ctypes
@@ -37,7 +47,10 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 BROWSER_EXES = ("msedge.exe", "chrome.exe")
 WINDOW_SIZE = (1280, 800)
-OFFSCREEN_MARGIN = 50
+SLIVER_PX = 2  # on-screen pixels left visible at the desktop edge -- confirmed
+# by measurement to keep DWM compositing hidden windows at full quality
+# (a fully off-screen window measured ~12% lower sharpness on video content).
+SLIVER_Y_GAP = 20  # extra vertical gap between staggered windows' slots
 FIND_TIMEOUT_S = 8.0
 POLL_INTERVAL_S = 0.15
 MIN_WINDOW_DIM = 300  # filters out small notification/dialog popups
@@ -103,23 +116,38 @@ def _app_path(exe: str) -> str | None:
 
 
 def is_offscreen(hwnd) -> bool:
-    """True if the window doesn't overlap the virtual desktop at all."""
+    """True if the window is hidden at (or very near) its off-screen
+    position -- i.e. not meaningfully on-screen, allowing for the small
+    sliver push_offscreen deliberately leaves visible (see SLIVER_PX)."""
     rect = wincap.get_window_rect(hwnd)
     if rect is None:
         return False
     left, top, right, bottom = rect
     vx, vy, vw, vh = wincap.virtual_screen_bounds()
-    return right <= vx or left >= vx + vw or bottom <= vy or top >= vy + vh
+    overlap_w = max(0, min(right, vx + vw) - max(left, vx))
+    overlap_h = max(0, min(bottom, vy + vh) - max(top, vy))
+    return overlap_w <= SLIVER_PX or overlap_h <= SLIVER_PX
 
 
-def push_offscreen(hwnd):
-    """(Re-)position a window outside the virtual desktop. Browsers
+def push_offscreen(hwnd, offset_index: int = 0):
+    """(Re-)position a window mostly outside the virtual desktop, leaving
+    a SLIVER_PX-wide sliver on-screen at the right edge -- confirmed by
+    measurement to keep DWM compositing GPU-accelerated content (video)
+    at full quality, unlike a fully off-screen position. Browsers
     sometimes restore their own remembered window position shortly after
     creation, which can pull a hidden window back on screen; call this
-    repeatedly (e.g. once per captured frame) to keep it enforced."""
+    repeatedly (e.g. once per captured frame) to keep it enforced.
+
+    offset_index staggers the vertical position (use a stable per-region
+    index, e.g. Region.slot) so multiple simultaneously-hidden windows
+    don't land on the exact same coordinates and occlude each other's
+    sliver -- which would undo the quality benefit for whichever window
+    ends up underneath."""
     vx, vy, vw, _ = wincap.virtual_screen_bounds()
     w, h = WINDOW_SIZE
-    wincap.move_window(hwnd, vx + vw + OFFSCREEN_MARGIN, vy, w, h)
+    x = vx + vw - SLIVER_PX
+    y = vy + offset_index * (h + SLIVER_Y_GAP)
+    wincap.move_window(hwnd, x, y, w, h)
 
 
 ONSCREEN_POSITION = (60, 60)
@@ -137,10 +165,30 @@ def bring_onscreen(hwnd):
     wincap.focus_window(hwnd)
 
 
-def launch_offscreen(url: str, browser_exe: str | None = None) -> tuple[int, str] | None:
+def restore_to_visible(hwnd, offset_index: int = 0):
+    """Move a hidden window back on-screen without stealing focus -- a
+    safety net so a window RegionOS never spawned (a drag-tracked app, or
+    a real, regular-profile browser) is never left stranded off-screen
+    once nothing tracks it anymore (region deleted, or RegionOS exiting).
+    This matters most for real browser windows: closing one normally
+    while it's still off-screen risks that position getting saved into
+    the user's own profile, so every code path that stops tracking a
+    non-managed window must route through this first. offset_index
+    cascades the landing spot so restoring several at once doesn't stack
+    them exactly on top of each other."""
+    w, h = WINDOW_SIZE
+    x = ONSCREEN_POSITION[0] + offset_index * 40
+    y = ONSCREEN_POSITION[1] + offset_index * 40
+    wincap.restore_window(hwnd)
+    wincap.move_window(hwnd, x, y, w, h)
+
+
+def launch_offscreen(url: str, browser_exe: str | None = None,
+                      offset_index: int = 0) -> tuple[int, str] | None:
     """Opens url in a new, hidden browser window. Blocks for up to
     FIND_TIMEOUT_S while the window appears. Returns (hwnd, title), or None
-    if no browser is installed or the window couldn't be located."""
+    if no browser is installed or the window couldn't be located.
+    offset_index is forwarded to push_offscreen -- see its docstring."""
     browser_exe = browser_exe or find_browser()
     if not browser_exe:
         return None
@@ -180,6 +228,6 @@ def launch_offscreen(url: str, browser_exe: str | None = None) -> tuple[int, str
     title = next((t for h, t in wincap.list_windows() if h == hwnd), "")
 
     wincap.restore_window(hwnd)
-    push_offscreen(hwnd)
+    push_offscreen(hwnd, offset_index)
 
     return hwnd, title

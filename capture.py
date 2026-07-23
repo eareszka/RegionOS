@@ -92,7 +92,7 @@ class WindowCaptureWorker(BaseWorker):
                     if now - self._last_relaunch >= RELAUNCH_COOLDOWN_S:
                         self._last_relaunch = now
                         self.note = "Reopening hidden window..."
-                        found = browserlaunch.launch_offscreen(r.url)
+                        found = browserlaunch.launch_offscreen(r.url, offset_index=r.slot)
                         if found:
                             self.hwnd, r.window_title = found
                     else:
@@ -103,23 +103,22 @@ class WindowCaptureWorker(BaseWorker):
                     time.sleep(1.0)
                     continue
             if wincap.is_minimized(self.hwnd):
-                if self.pinned_onscreen:
-                    # Minimizing a window the user brought forward reads as
-                    # "I'm done with it" -- send it back to hidden tracking
-                    # instead of freezing capture on the last frame. Applies
-                    # to any tracked window, not just managed websites.
-                    self.pinned_onscreen = False
-                    wincap.restore_window(self.hwnd)
-                    browserlaunch.push_offscreen(self.hwnd)
-                    continue
-                self.note = "Minimized — showing last frame"
-                time.sleep(0.5)
+                # Windows doesn't render minimized windows, so capture would
+                # otherwise freeze on the last frame. Tracked windows are
+                # never supposed to sit minimized -- whether the user just
+                # minimized one they'd brought on-screen ("I'm done with
+                # it") or minimized one out of habit -- so un-minimize and
+                # push it off-screen instead: capture stays live, and the
+                # desktop stays just as clear as if it had stayed minimized.
+                self.pinned_onscreen = False
+                wincap.restore_window(self.hwnd)
+                browserlaunch.push_offscreen(self.hwnd, offset_index=r.slot)
                 continue
             if r.url and not self.pinned_onscreen and not browserlaunch.is_offscreen(self.hwnd):
                 # The browser re-asserted its own remembered window bounds;
                 # keep the hidden window actually hidden. Skipped while
                 # pinned_onscreen -- the user brought it forward on purpose.
-                browserlaunch.push_offscreen(self.hwnd)
+                browserlaunch.push_offscreen(self.hwnd, offset_index=r.slot)
             start = time.perf_counter()
             img = wincap.grab_window(self.hwnd)
             if img is None:

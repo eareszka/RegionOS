@@ -102,7 +102,8 @@ class WindowPicker(tk.Toplevel):
         tk.Label(self, text="Track which window?", bg=BG, fg=FG,
                  font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 8))
         tk.Label(self, text="The region keeps updating even when this window\n"
-                            "is covered by other windows (not when minimized).",
+                            "is covered -- or if you minimize it, RegionOS moves\n"
+                            "it off-screen instead so it stays live.",
                  bg=BG, fg=DIM, font=("Segoe UI", 9), justify="left").pack(
                      anchor="w", pady=(0, 8))
 

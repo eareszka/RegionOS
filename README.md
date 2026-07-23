@@ -21,8 +21,9 @@ python main.py
 
 Each region card shows a **live preview**, geometry, and status; per-region **FPS** (1 / 5 / 10 / 30 / 60), each on its own capture thread. **Pause / Resume**, **Rename** (double-click the name), **Reselect**, **Delete**. Regions persist to `regions.json` and reload on launch.
 
+**Minimizing a tracked window doesn't freeze it.** Windows doesn't render minimized windows, so instead of letting capture freeze on the last frame, RegionOS un-minimizes the window and moves it off-screen — it keeps capturing live, and stays just as invisible on your desktop as if it had stayed minimized. Double-click the tile to bring it back on-screen; double-click again (or minimize it) to hide it.
+
 **Window-capture limits (Windows platform, same as OBS):**
-- *Minimized* windows aren't rendered by Windows — the region freezes on the last frame and shows "Minimized". Keep the window open-but-covered instead.
 - *Background browser tabs* aren't rendered by the browser. Pop the tab out into its own window and track that.
 
 **Browsers pause when fully covered.** Chrome/Edge stop painting a window that
