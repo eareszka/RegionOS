@@ -12,6 +12,14 @@ pip install -r requirements.txt
 python main.py
 ```
 
+Or run `dist/RegionOS.exe` directly -- a standalone build that needs no
+Python install. Rebuild it after changing code with:
+
+```
+pip install pyinstaller
+pyinstaller --onefile --windowed --icon=icon.ico --add-data "icon.ico;." --name RegionOS main.py
+```
+
 ## Use
 
 **+ New Region** offers two region types:
@@ -27,9 +35,8 @@ Each region card shows a **live preview**, geometry, and status; per-region **FP
 - *Background browser tabs* aren't rendered by the browser. Pop the tab out into its own window and track that.
 
 **Browsers pause when fully covered.** Chrome/Edge stop painting a window that
-is completely hidden behind opaque windows, so a tracked page can appear frozen.
-RegionOS's own window is exempt (it renders at 99% opacity, which Chromium
-doesn't count as occluding). For *other* windows covering the browser, either
+is completely hidden behind opaque windows, so a tracked page can appear frozen
+if RegionOS's own window (or anything else) sits directly on top of it. Either
 leave a sliver of the browser visible, or launch it with throttling disabled:
 
 ```
@@ -49,6 +56,7 @@ Firefox: set `widget.windows.window_occlusion_tracking.enabled` to false in `abo
 | `capture.py` | Per-region capture threads (screen: mss, window: wincap) |
 | `wincap.py` | Win32 PrintWindow capture (works while window is covered) |
 | `regions.py` | Region model + `regions.json` persistence |
+| `icon.ico` | App icon (exe file icon + window/taskbar icon) |
 
 ## Roadmap (from Desc.pdf, minus AI)
 
